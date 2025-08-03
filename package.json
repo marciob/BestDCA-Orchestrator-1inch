@@ -1,0 +1,21 @@
+{
+  "name": "Orchestrator",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "tsx index.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@1inch/limit-order-sdk": "4.9.5-rc.0",
+    "dotenv": "^17.2.1",
+    "ethers": "^6.15.0",
+    "ethersjs": "0.0.1-security",
+    "tsx": "^4.20.3",
+    "ws": "^8.18.3"
+  }
+}
