@@ -11,11 +11,8 @@ import {
   WebSocketProvider,
   Wallet,
   Contract,
-  Interface,
-  id,
   getAddress,
   keccak256,
-  toUtf8Bytes,
 } from "ethers";
 import {
   Api,
@@ -118,15 +115,32 @@ const cancelOrder = async (hash: string) =>
 const remaining = new Map<string, bigint>();
 const secrets = new Map<string, `0x${string}`>(); // orderHash ➜ secret
 
+/* ───────── listen for Vault.Deposited ───────── */
+console.log("👂  waiting for Deposited events on", VAULT_ADDR);
+
+vault.on(
+  vault.filters.Deposited(),
+  async (user: string, amount: bigint, event) => {
+    try {
+      // Only orchestrate for our signer address
+      if (user.toLowerCase() !== signer.address.toLowerCase()) return;
+      console.log(
+        `🪙  Deposit detected: ${amount / 10n ** 18n} ETH from ${user}`
+      );
+
+      // TODO: Add deposit handling logic here if needed
+      // For now, this just logs the deposit
+    } catch (err) {
+      console.warn("❌  Deposited handler error:", err);
+    }
+  }
+);
+
 /* ───────── listen for Vault.DCAStarted ───────── */
 console.log("⏰  waiting for DCAStarted on", VAULT_ADDR);
 
-const iface = new Interface(vaultJson.abi);
-const topic = id("DCAStarted(bytes32)");
-
-provider.on({ address: VAULT_ADDR, topics: [topic] }, async (log) => {
+vault.on(vault.filters.DCAStarted(), async (orderHash: string, event) => {
   try {
-    const orderHash = iface.parseLog(log)!.args[0] as string;
     console.log("⏰  new DCA:", orderHash);
 
     /* 1️⃣  pull params from vault */
@@ -146,7 +160,7 @@ provider.on({ address: VAULT_ADDR, topics: [topic] }, async (log) => {
 
     /* 2️⃣  start HTLC ------------------------------------------------*/
     const secret = ("0x" + randomBytes(32).toString("hex")) as `0x${string}`;
-    const hashLock = keccak256(secret as `0x${string}`);
+    const hashLock = keccak256(secret);
     secrets.set(orderHash, secret);
 
     const htlcTx = await (vault as any)
