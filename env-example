@@ -1,0 +1,12 @@
+PRIV_KEY=""
+ONEINCH_API_KEY=
+BASE_WSS_URL=""
+
+
+# orchestrator/.env
+RPC_URL=""
+CHAIN_ID=
+VAULT_ADDR=
+GUARD_ADDR=
+
+FRONTEND_URL=http://localhost:3000/
