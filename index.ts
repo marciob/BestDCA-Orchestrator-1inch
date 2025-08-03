@@ -1,6 +1,22 @@
 // orchestrator/index.ts
+/**********************************************************************
+ * 1️⃣  Orchestrator – posts the master Limit Order, starts the Vault’s
+ *     HTLC + DCA timer, streams fills, reveals the secret when done
+ *
+ *     ▸ Requires NODE ≥18  (crypto.randomBytes is used)
+ *     ▸ Env vars:  FRONTEND_URL, BASE_WSS_URL, PRIV_KEY, ONEINCH_API_KEY
+ *********************************************************************/
 import "dotenv/config";
-import { JsonRpcProvider, Wallet, Contract } from "ethers";
+import {
+  WebSocketProvider,
+  Wallet,
+  Contract,
+  Interface,
+  id,
+  getAddress,
+  keccak256,
+  toUtf8Bytes,
+} from "ethers";
 import {
   Api,
   Address,
@@ -10,31 +26,35 @@ import {
   randBigInt,
   HttpProviderConnector,
 } from "@1inch/limit-order-sdk";
-import { Interface, id } from "ethers";
-import WebSocket from "ws"; // <- node-ws poly-fill
+import WebSocket from "ws";
+import { randomBytes } from "crypto";
 
 import vaultJson from "../contracts/artifacts/contracts/Vault.sol/Vault.json" assert { type: "json" };
 import guardJson from "../contracts/artifacts/contracts/TimeBucketPriceGuard.sol/TimeBucketPriceGuard.json" assert { type: "json" };
 
-/* ─────────── constants (Base-Sepolia) ─────────── */
-const RPC_URL = "https://sepolia.base.org";
+/* ─────────────────────────  helpers  ────────────────────────────── */
+const ck = (addr: string) => getAddress(addr) as `0x${string}`;
+
+/* ───────── env: where to POST fills ───────── */
+const FRONTEND_URL = process.env.FRONTEND_URL!; // e.g. https://best-dca.vercel.app
+
+/* ───────── constants (Base-Sepolia) ───────── */
 const CHAIN_ID = 84532;
-const VAULT_ADDR = "0xFf30dbaFc3033f591c062d767D5E8A61f5e165B9";
-const GUARD_ADDR = "0x0123456789abcdef0123456789abcdef01234567";
+const VAULT_ADDR = ck("0xe82F3C18a91E25CEe4DeE40C0187fa6dEf89E6E1"); // ← new!
+const GUARD_ADDR = ck("0xBA4e75B7b414e5983F92131C7827A9B98e00453e");
+const WETH = ck("0x4200000000000000000000000000000000000006");
+const WBTC = ck("0xa1b2c3d4e5f678901234567890abcdefabcdef12");
+const FEED_ADDR = ck("0xad8CAE210Fe5885AF4fdbF9B709f0a242b6126fA");
 
-const WETH = "0x4200000000000000000000000000000000000006";
-const WBTC = "0xYourWBTCtestnetToken"; // 🔁 update
-const FEED_ADDR = "0xYourChainlinkFeed"; // 🔁 update (ETH/WBTC)
-
-/* ─────────── provider & signer ─────────── */
-const provider = new JsonRpcProvider(RPC_URL);
+/* ───────── provider & signer ───────── */
+const provider = new WebSocketProvider(process.env.BASE_WSS_URL!);
 const signer = new Wallet(process.env.PRIV_KEY!, provider);
 
-/* ─────────── on-chain contracts ─────────── */
+/* ───────── contracts ───────── */
 const vault = new Contract(VAULT_ADDR, vaultJson.abi, provider);
 const guard = new Contract(GUARD_ADDR, guardJson.abi, provider);
 
-/* ─────────── minimal fetch connector ─────────── */
+/* ───────── fetch connector for 1inch SDK ───────── */
 class FetchConnector implements HttpProviderConnector {
   get = <T>(url: string, h: Record<string, string>) =>
     fetch(url, { headers: h }).then((r) => r.json()) as Promise<T>;
@@ -45,102 +65,104 @@ class FetchConnector implements HttpProviderConnector {
       body: JSON.stringify(d),
     }).then((r) => r.json()) as Promise<T>;
 }
-
-/* ─────────── base SDK – only used for submitOrder ─────────── */
-const api = new Api({
-  authKey: process.env.ONEINCH_API_KEY!,
-  networkId: CHAIN_ID,
-  httpConnector: new FetchConnector(),
-});
-
-/* ─────────── helpers missing from the SDK build ─────────── */
-type FillEvt = { type: "FILL"; orderHash: string; makingAmount: bigint };
-
-function streamOrderbook(
-  chainId: number,
-  orderHash: string,
-  cb: (e: FillEvt) => void
-) {
-  const url = `wss://api.1inch.dev/orderbook/v1.2/${chainId}/ws`;
-  const ws = new WebSocket(url, {
-    headers: { Authorization: `Bearer ${process.env.ONEINCH_API_KEY}` },
+const apiFor = (cid: number) =>
+  new Api({
+    authKey: process.env.ONEINCH_API_KEY!,
+    networkId: cid,
+    httpConnector: new FetchConnector(),
   });
 
-  ws.on("open", () => {
+/* ───────── order-book stream helper ───────── */
+type FillEvt = { type: "FILL"; orderHash: string; makingAmount: bigint };
+const streamOrderbook = (
+  cid: number,
+  hash: string,
+  cb: (e: FillEvt) => void
+) => {
+  const ws = new WebSocket(`wss://api.1inch.dev/orderbook/v1.2/${cid}/ws`, {
+    headers: { Authorization: `Bearer ${process.env.ONEINCH_API_KEY}` },
+  });
+  ws.on("open", () =>
     ws.send(
       JSON.stringify({
         action: "subscribe",
         eventTypes: ["FILL"],
-        orderHashes: [orderHash],
+        orderHashes: [hash],
       })
-    );
-  });
-
-  ws.on("message", (data) => {
-    const msg = JSON.parse(data.toString());
-    if (msg.eventType === "FILL")
+    )
+  );
+  ws.on("message", (d) => {
+    const m = JSON.parse(d.toString());
+    if (m.eventType === "FILL")
       cb({
         type: "FILL",
-        orderHash: msg.orderHash,
-        makingAmount: BigInt(msg.makingAmount),
+        orderHash: m.orderHash,
+        makingAmount: BigInt(m.makingAmount),
       });
   });
-
   return () => ws.close();
-}
+};
 
-async function cancelOrder(orderHash: string) {
-  await fetch(`https://api.1inch.dev/orderbook/v1.2/limit-order/cancel`, {
+/* ───────── cancel helper ───────── */
+const cancelOrder = async (hash: string) =>
+  fetch("https://api.1inch.dev/orderbook/v1.2/limit-order/cancel", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${process.env.ONEINCH_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ orderHash }),
+    body: JSON.stringify({ orderHash: hash }),
   });
-}
 
-/* ─────────── bookkeeping (orderHash → remaining WETH) ─────────── */
+/* ───────── bookkeeping ───────── */
 const remaining = new Map<string, bigint>();
+const secrets = new Map<string, `0x${string}`>(); // orderHash ➜ secret
 
-/* ─────────── listen for DCAStarted events ─────────── */
-console.log("⏰  waiting for DCA events on", VAULT_ADDR);
+/* ───────── listen for Vault.DCAStarted ───────── */
+console.log("⏰  waiting for DCAStarted on", VAULT_ADDR);
 
 const iface = new Interface(vaultJson.abi);
 const topic = id("DCAStarted(bytes32)");
 
 provider.on({ address: VAULT_ADDR, topics: [topic] }, async (log) => {
   try {
-    const parsed = iface.parseLog(log)!;
-    const orderHash = parsed.args[0] as string;
+    const orderHash = iface.parseLog(log)!.args[0] as string;
+    console.log("⏰  new DCA:", orderHash);
 
-    console.log("⏰  new DCA", orderHash);
-
-    /* 1. pull params from vault */
-    const { sliceSize, totalAmount } = await vault.dcaParams(orderHash);
-
+    /* 1️⃣  pull params from vault */
+    const params = (await (vault as any).dcaParamsOf(orderHash)) as {
+      sliceSize: bigint;
+      startTime: bigint;
+      deltaTime: bigint;
+      totalAmount: bigint;
+    };
+    const { sliceSize, deltaTime, totalAmount } = params;
     remaining.set(orderHash, totalAmount);
 
-    /* 2. predicate via helper contract */
-    const predicate = guard.interface.encodeFunctionData("isValidFill", [
+    /* compute duration and HTLC refund time */
+    const numberOfSlices = totalAmount / sliceSize;
+    const duration = numberOfSlices * deltaTime;
+    const refundTime = Number(params.startTime + duration + 86_400n); // +1 day grace
+
+    /* 2️⃣  start HTLC ------------------------------------------------*/
+    const secret = ("0x" + randomBytes(32).toString("hex")) as `0x${string}`;
+    const hashLock = keccak256(secret as `0x${string}`);
+    secrets.set(orderHash, secret);
+
+    const htlcTx = await (vault as any)
+      .connect(signer)
+      .startHTLC(hashLock, refundTime);
+    console.log("🔐 startHTLC tx →", htlcTx.hash);
+    await htlcTx.wait();
+
+    /* 3️⃣  build predicate calldata for price-guard */
+    const pred = guard.interface.encodeFunctionData("isValidFill", [
       orderHash,
       sliceSize,
     ]);
 
-    const extension = new Extension({
-      makerAssetSuffix: "",
-      takerAssetSuffix: "",
-      makingAmountData: "",
-      takingAmountData: "",
-      predicate,
-      makerPermit: "",
-      preInteraction: "",
-      postInteraction: "",
-      customData: "",
-    });
-
-    /* 3. maker traits */
-    const expiry = BigInt(Math.floor(Date.now() / 1000)) + 86_400n;
+    /* 4️⃣  maker traits + extension */
+    const expiry = BigInt(Math.floor(Date.now() / 1e3)) + 86_400n;
     const traits = MakerTraits.default()
       .setPartialFills(true)
       .allowMultipleFills()
@@ -148,7 +170,19 @@ provider.on({ address: VAULT_ADDR, topics: [topic] }, async (log) => {
       .withNonce(randBigInt((1n << 48n) - 1n))
       .withExtension();
 
-    /* 4. build + sign */
+    const ext = new Extension({
+      makerAssetSuffix: "",
+      takerAssetSuffix: "",
+      makingAmountData: "",
+      takingAmountData: "",
+      predicate: pred,
+      makerPermit: "",
+      preInteraction: "",
+      postInteraction: "",
+      customData: "",
+    });
+
+    /* 5️⃣  assemble + sign order */
     const order = new LimitOrder(
       {
         makerAsset: new Address(WETH),
@@ -159,9 +193,8 @@ provider.on({ address: VAULT_ADDR, topics: [topic] }, async (log) => {
         receiver: new Address(VAULT_ADDR),
       },
       traits,
-      extension
+      ext
     );
-
     const typed = order.getTypedData(CHAIN_ID);
     const sig = await signer.signTypedData(
       typed.domain,
@@ -169,29 +202,55 @@ provider.on({ address: VAULT_ADDR, topics: [topic] }, async (log) => {
       typed.message
     );
 
-    await api.submitOrder(order, sig);
+    await apiFor(CHAIN_ID).submitOrder(order, sig);
     console.log("✅  master order posted");
 
-    /* 5. live fill stream */
-    const unsub = streamOrderbook(CHAIN_ID, orderHash, (evt) => {
-      const left = (remaining.get(orderHash) ?? 0n) - evt.makingAmount;
+    /* 6️⃣  call startDCA so Vault emits DCAStarted (already fired once) */
+    const tx = await (vault as any)
+      .connect(signer)
+      .startDCA(orderHash, duration, sliceSize, deltaTime);
+    console.log("🟢  startDCA tx →", tx.hash);
+    await tx.wait();
+
+    /* 7️⃣  live fill stream */
+    const unsub = streamOrderbook(CHAIN_ID, orderHash, async (e) => {
+      const left = (remaining.get(orderHash) ?? 0n) - e.makingAmount;
       remaining.set(orderHash, left);
+      console.log(`⚡ fill: ${e.makingAmount} WETH — left ${left}`);
 
-      console.log(`⚡ slice filled – ${evt.makingAmount} WETH   left: ${left}`);
+      /* push to frontend */
+      try {
+        await fetch(`${FRONTEND_URL}/api/fill`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: `${orderHash}-${e.makingAmount}-${Date.now()}`,
+            chain: "Base",
+            amount: (e.makingAmount / 10n ** 18n).toString(),
+            time: new Date().toISOString(),
+          }),
+        });
+      } catch (postErr) {
+        console.error("fill → frontend failed:", postErr);
+      }
 
+      /* all slices filled → reveal secret + cancel */
       if (left <= 0n) {
-        console.log("🎉 DCA complete → cancelling order");
+        console.log("🎉 DCA complete → revealing secret & cancelling");
+        const secretHex = secrets.get(orderHash)!;
+        await (vault as any).connect(signer).revealSecret(secretHex);
         cancelOrder(orderHash).catch(console.error);
         remaining.delete(orderHash);
+        secrets.delete(orderHash);
         unsub();
       }
     });
   } catch (err) {
-    console.warn("❌  failed to process event", err);
+    console.warn("❌  handler error:", err);
   }
 });
 
-/* ─────────── oracle-health watchdog (optional safety) ─────────── */
+/* ───────── Chainlink watchdog ───────── */
 const feedAbi = [
   "function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)",
 ];
@@ -201,13 +260,13 @@ setInterval(async () => {
   try {
     const { answeredInRound } = await feed.latestRoundData();
     if (answeredInRound === 0n) {
-      console.warn("⚠️  Chainlink stale – cancelling all active orders");
-      for (const hash of remaining.keys()) {
-        cancelOrder(hash).catch(console.error);
-        remaining.delete(hash);
+      console.warn("⚠️  stale oracle — cancelling all");
+      for (const h of remaining.keys()) {
+        cancelOrder(h).catch(console.error);
+        remaining.delete(h);
       }
     }
   } catch (e) {
-    console.error("oracle check failed", e);
+    console.error("oracle check failed:", e);
   }
 }, 60_000);
